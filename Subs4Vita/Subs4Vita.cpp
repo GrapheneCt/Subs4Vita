@@ -1,10 +1,54 @@
 ﻿#include <iostream>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <filesystem>
+#include <map>
 
 #include <windows.h>
 #include <tlhelp32.h>
+
+#include "tinyxml2.h"
+
+static std::map<std::string, std::string> s_colorMap = {
+	// Basic colors
+	{"000000", "black"},
+	{"ffffff", "white"},
+	{"ff0000", "red"},
+	{"00ff00", "lime"},      // pure green
+	{"0000ff", "blue"},
+	{"ffff00", "yellow"},
+	{"00ffff", "cyan"},
+	{"ff00ff", "magenta"},
+
+	// Common variations
+	{"c0c0c0", "silver"},
+	{"808080", "gray"},
+	{"800000", "maroon"},
+	{"808000", "olive"},
+	{"008000", "green"},
+	{"800080", "purple"},
+	{"008080", "teal"},
+	{"000080", "navy"},
+
+	// Additional frequent colors
+	{"ffa500", "orange"},
+	{"ffc0cb", "pink"},
+	{"a52a2a", "brown"},
+	{"f0f8ff", "aliceblue"},
+	{"faf0e6", "linen"},
+	{"f5f5dc", "beige"},
+	{"f0ffff", "azure"},
+	{"fff0f5", "lavenderblush"},
+	{"ffd700", "gold"},
+	{"d2691e", "chocolate"},
+	{"2e8b57", "seagreen"},
+	{"4682b4", "steelblue"},
+	{"6a5acd", "slateblue"},
+	{"ff69b4", "hotpink"},
+	{"ff4500", "orangered"},
+	{"daa520", "goldenrod"},
+};
 
 // M4T header from the sample file UV0001-NPVB22293_CN-7258854.M4T
 static unsigned char s_m4tHeader[1646] = {
@@ -240,6 +284,20 @@ void promptExit()
 	}
 }
 
+std::string getColorLiteral(std::string const& hexColor)
+{
+	auto it = s_colorMap.find(hexColor);
+	if (it != s_colorMap.end())
+	{
+		return it->second;
+	}
+	else
+	{
+		std::wcerr << L"  WARNING: Encountered unknown color " << hexColor.c_str() << ", will use \"white\"\n";
+		return "white";
+	}
+}
+
 int wmain(int argc, wchar_t* argv[])
 {
 	std::wstring parentProcess = GetParentProcessName(GetCurrentProcessId());
@@ -253,6 +311,18 @@ int wmain(int argc, wchar_t* argv[])
 		std::wcout << L"Nothing to convert\n";
 		promptExit();
 		return 0;
+	}
+
+	// Load config XML file
+	tinyxml2::XMLDocument confdoc;
+	tinyxml2::XMLElement* confstyle = NULL;
+	tinyxml2::XMLElement* confregion = NULL;
+	if (confdoc.LoadFile("config.xml") == tinyxml2::XML_SUCCESS)
+	{
+		std::wcerr << L"Loading config file...\n";
+
+		confstyle = confdoc.FirstChildElement("tt")->FirstChildElement("head")->FirstChildElement("styling");
+		confregion = confdoc.FirstChildElement("tt")->FirstChildElement("head")->FirstChildElement("layout");
 	}
 
 	std::wcout << L"Received " << (argc - 1) << L" file(s):\n\n";
@@ -305,12 +375,95 @@ int wmain(int argc, wchar_t* argv[])
 
 		file.clear();
 		file.seekg(0, std::ios::beg);
-		outFile << file.rdbuf();
+
+		// Convert colors from hex representation to literal
+		std::stringstream tmp;
+		tmp << file.rdbuf();
+
+		tinyxml2::XMLDocument doc;
+		if (doc.Parse(tmp.str().c_str(), tmp.str().length()) != tinyxml2::XML_SUCCESS)
+		{
+			std::wcerr << L"  ERROR: Failed to parse XML: " << doc.ErrorStr() << L"\n";
+			continue;
+		}
+
+		tinyxml2::XMLElement* styling = doc.FirstChildElement("tt")->FirstChildElement("head")->FirstChildElement("styling");
+		if (!styling)
+		{
+			std::wcerr << L"  ERROR: Failed to parse XML\n";
+			continue;
+		}
+
+		for (tinyxml2::XMLElement* style = styling->FirstChildElement("style"); style != nullptr; style = style->NextSiblingElement("style"))
+		{
+			const char* col = style->Attribute("tts:color");
+			std::string scol = col ? col : "";
+			if (!scol.compare(0, 1, "#"))
+			{
+				scol = getColorLiteral(scol.substr(1));
+				style->SetAttribute("tts:color", scol.c_str());
+			}
+
+			// Apply global style config attributes
+			if (confstyle)
+			{
+				for (const tinyxml2::XMLAttribute* attrib = confstyle->FirstAttribute(); attrib != nullptr; attrib = attrib->Next())
+				{
+					style->SetAttribute(attrib->Name(), attrib->Value());
+				}
+			}
+		}
+
+		tinyxml2::XMLElement* layout = doc.FirstChildElement("tt")->FirstChildElement("head")->FirstChildElement("layout");
+		if (!layout)
+		{
+			std::wcerr << L"  ERROR: Failed to parse XML\n";
+			continue;
+		}
+
+		for (tinyxml2::XMLElement* region = layout->FirstChildElement("region"); region != nullptr; region = region->NextSiblingElement("region"))
+		{
+			// Apply global region config attributes
+			if (confregion)
+			{
+				for (const tinyxml2::XMLAttribute* attrib = confregion->FirstAttribute(); attrib != nullptr; attrib = attrib->Next())
+				{
+					region->SetAttribute(attrib->Name(), attrib->Value());
+				}
+			}
+		}
+
+		tinyxml2::XMLElement* div = doc.FirstChildElement("tt")->FirstChildElement("body")->FirstChildElement("div");
+		if (!div)
+		{
+			std::wcerr << L"  ERROR: Failed to parse XML\n";
+			continue;
+		}
+
+		// Relocate global style to each p element (required on Vita M4T)
+		const char* divstyle = div->Attribute("style");
+		if (divstyle)
+		{
+			std::string sdivstyle = divstyle;
+			for (tinyxml2::XMLElement* p = div->FirstChildElement("p"); p != nullptr; p = p->NextSiblingElement("p"))
+			{
+				const char* pstyle = p->Attribute("style");
+				if (!pstyle)
+				{
+					p->SetAttribute("style", divstyle);
+				}
+			}
+		}
+
+		tinyxml2::XMLPrinter printer;
+		doc.Print(&printer);
+
+		outFile << printer.CStr();
 
 		if (!outFile)
 		{
 			std::wcerr << L"  ERROR: Failed when writing to output file\n";
-			return false;
+			continue;
 		}
 
 		outFile.close();
